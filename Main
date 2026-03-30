@@ -1,0 +1,298 @@
+import os
+import time
+import copy
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+import torchvision.models as models
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+from sklearn.model_selection import StratifiedKFold
+from scipy import stats
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==============================
+# 1. DATASET LOADER
+# ==============================
+
+class XrayDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.image_paths = []
+        self.labels = []
+        self.transform = transform
+
+        for label, folder in enumerate(["NORMAL", "PNEUMONIA"]):
+            folder_path = os.path.join(root_dir, folder)
+            for img in os.listdir(folder_path):
+                self.image_paths.append(os.path.join(folder_path, img))
+                self.labels.append(label)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        label = self.labels[idx]
+
+        if self.transform:
+            img = self.transform(img)
+
+        return img, label
+
+# ==============================
+# 2. SELF-SUPERVISED LEARNING (SimCLR)
+# ==============================
+
+class ProjectionHead(nn.Module):
+    def __init__(self, in_dim, out_dim=128):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, out_dim)
+        )
+
+    def forward(self, x):
+        return self.fc(x)
+
+class SimCLR(nn.Module):
+    def __init__(self, base_model):
+        super().__init__()
+        self.encoder = base_model
+        self.encoder.fc = nn.Identity()
+        self.projector = ProjectionHead(512)
+
+    def forward(self, x):
+        h = self.encoder(x)
+        z = self.projector(h)
+        return z
+
+def contrastive_loss(z1, z2, temperature=0.5):
+    z1 = nn.functional.normalize(z1, dim=1)
+    z2 = nn.functional.normalize(z2, dim=1)
+
+    logits = torch.mm(z1, z2.T) / temperature
+    labels = torch.arange(z1.size(0)).to(device)
+
+    return nn.CrossEntropyLoss()(logits, labels)
+
+# ==============================
+# 3. CAUSALITY-AWARE REGULARIZATION
+# ==============================
+
+def causality_loss(f1, f2):
+    # Encourage invariant representations
+    return torch.mean((f1 - f2) ** 2)
+
+# ==============================
+# 4. CLASSIFIER MODEL
+# ==============================
+
+class PneumoniaModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base = models.resnet18(pretrained=True)
+        self.base.fc = nn.Linear(512, 2)
+
+    def forward(self, x):
+        return self.base(x)
+
+# ==============================
+# 5. DATA AUGMENTATION
+# ==============================
+
+transform_ssl = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ToTensor()
+])
+
+transform_eval = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor()
+])
+
+# ==============================
+# 6. TRAINING FUNCTIONS
+# ==============================
+
+def pretrain_ssl(model, dataloader, epochs=5):
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for x, _ in dataloader:
+            x1 = x.to(device)
+            x2 = x.flip(-1).to(device)
+
+            z1 = model(x1)
+            z2 = model(x2)
+
+            loss = contrastive_loss(z1, z2)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"SSL Epoch {epoch+1}, Loss: {total_loss:.4f}")
+
+def train_classifier(model, dataloader, epochs=5):
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+
+            x_aug = x.flip(-1)
+
+            out1 = model(x)
+            out2 = model(x_aug)
+
+            loss_cls = criterion(out1, y)
+            loss_causal = causality_loss(out1, out2)
+
+            loss = loss_cls + 0.3 * loss_causal
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
+
+# ==============================
+# 7. GRAD-CAM EXPLAINABILITY
+# ==============================
+
+def grad_cam(model, image):
+    model.eval()
+    gradients = []
+    activations = []
+
+    def backward_hook(module, grad_in, grad_out):
+        gradients.append(grad_out[0])
+
+    def forward_hook(module, inp, out):
+        activations.append(out)
+
+    target_layer = model.base.layer4
+    target_layer.register_forward_hook(forward_hook)
+    target_layer.register_backward_hook(backward_hook)
+
+    output = model(image)
+    pred = output.argmax()
+
+    output[:, pred].backward()
+
+    grads = gradients[0]
+    acts = activations[0]
+
+    weights = torch.mean(grads, dim=(2, 3), keepdim=True)
+    cam = torch.sum(weights * acts, dim=1).squeeze()
+
+    cam = torch.relu(cam)
+    cam = cam / cam.max()
+
+    return cam.detach().cpu().numpy()
+
+# ==============================
+# 8. EVALUATION
+# ==============================
+
+def evaluate(model, dataloader):
+    model.eval()
+    y_true, y_pred = [], []
+
+    with torch.no_grad():
+        for x, y in dataloader:
+            x = x.to(device)
+            outputs = model(x)
+            preds = torch.argmax(outputs, dim=1)
+
+            y_true.extend(y.numpy())
+            y_pred.extend(preds.cpu().numpy())
+
+    acc = accuracy_score(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
+
+    print("\nAccuracy:", acc)
+    print("\nClassification Report:\n", classification_report(y_true, y_pred))
+
+    plt.figure()
+    sns.heatmap(cm, annot=True, fmt='d')
+    plt.title("Confusion Matrix")
+    plt.show()
+
+    return acc
+
+# ==============================
+# 9. CROSS-VALIDATION + STATS
+# ==============================
+
+def cross_validation(dataset, k=5):
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
+    indices = np.arange(len(dataset))
+    labels = dataset.labels
+
+    accuracies = []
+
+    for fold, (train_idx, test_idx) in enumerate(skf.split(indices, labels)):
+        print(f"\nFold {fold+1}/{k}")
+
+        train_subset = torch.utils.data.Subset(dataset, train_idx)
+        test_subset = torch.utils.data.Subset(dataset, test_idx)
+
+        train_loader = DataLoader(train_subset, batch_size=16, shuffle=True)
+        test_loader = DataLoader(test_subset, batch_size=16)
+
+        model = PneumoniaModel().to(device)
+
+        train_classifier(model, train_loader)
+        acc = evaluate(model, test_loader)
+
+        accuracies.append(acc)
+
+    mean_acc = np.mean(accuracies)
+    std_acc = np.std(accuracies)
+
+    ci = stats.t.interval(
+        0.95, len(accuracies)-1,
+        loc=mean_acc,
+        scale=stats.sem(accuracies)
+    )
+
+    print("\n=== Statistical Results ===")
+    print("Mean Accuracy:", mean_acc)
+    print("Std Dev:", std_acc)
+    print("95% CI:", ci)
+
+# ==============================
+# 10. RUN PIPELINE
+# ==============================
+
+dataset = XrayDataset("chest_xray", transform=transform_ssl)
+dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+# SSL Pretraining
+ssl_model = SimCLR(models.resnet18(pretrained=False)).to(device)
+pretrain_ssl(ssl_model, dataloader)
+
+# Supervised + Causal Training + Evaluation
+cross_validation(dataset, k=5)
